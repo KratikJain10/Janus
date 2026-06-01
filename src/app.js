@@ -5,6 +5,10 @@ import authPlugin from './plugins/auth.js';
 import rateLimitPlugin from './plugins/rateLimit.js';
 import healthRoutes from './routes/health.js';
 import chatRoutes from './routes/chat.js';
+import usageRoutes from './routes/usage.js';
+import metricsRoutes from './routes/metrics.js';
+import { metrics } from './lib/metrics.js';
+import { logUsage } from './usage/logger.js';
 
 /**
  * Build a configured Fastify instance without starting it.
@@ -23,6 +27,38 @@ export function buildApp(config, deps = {}) {
   // why: expose validated config to routes/plugins as fastify.config so nothing
   // reads process.env directly past startup.
   app.decorate('config', config);
+
+  // why: pre-declare so the chat route can stash per-request usage for the
+  // onResponse hook to persist (stable request shape for V8).
+  app.decorateRequest('usage', null);
+
+  // why: record metrics for every (non-hijacked) response and persist usage when
+  // a handler attached it. Runs after the response is sent, so it never adds
+  // latency; streaming responses (which hijack the socket and skip onResponse)
+  // record themselves in the chat route.
+  app.addHook('onResponse', async (request, reply) => {
+    const route = request.routeOptions?.url ?? request.url;
+    metrics.recordRequest({
+      route,
+      status: reply.statusCode,
+      latencyMs: reply.elapsedTime,
+    });
+    const cache = reply.getHeader('x-cache');
+    if (cache === 'HIT') metrics.recordCache(true);
+    else if (cache === 'MISS') metrics.recordCache(false);
+
+    if (request.usage && request.apiKey) {
+      try {
+        await logUsage(app.pg, {
+          apiKeyId: request.apiKey.id,
+          latencyMs: Math.round(reply.elapsedTime),
+          ...request.usage,
+        });
+      } catch (err) {
+        request.log.error({ err }, 'failed to persist usage');
+      }
+    }
+  });
 
   // why: single, consistent error shape across the whole gateway.
   app.setErrorHandler((err, request, reply) => {
@@ -46,6 +82,8 @@ export function buildApp(config, deps = {}) {
 
   app.register(healthRoutes);
   app.register(chatRoutes);
+  app.register(usageRoutes);
+  app.register(metricsRoutes);
 
   return app;
 }

@@ -11,6 +11,9 @@ import {
   getCachedResponse,
   setCachedResponse,
 } from '../cache/exactCache.js';
+import { computeCost } from '../usage/cost.js';
+import { logUsage, extractTokens } from '../usage/logger.js';
+import { metrics } from '../lib/metrics.js';
 
 // why: validate the fields the gateway reasons about, but .passthrough() so any
 // other OpenAI parameter (stop, presence_penalty, tools, ...) forwards intact.
@@ -65,8 +68,8 @@ export default async function chatRoutes(fastify) {
 
       if (body.stream) {
         // why: streaming responses are never cached (can't buffer them, and
-        // the cache stores whole JSON bodies). Phase 2 path, untouched.
-        return streamCompletion(request, reply, provider, body);
+        // the cache stores whole JSON bodies).
+        return streamCompletion(fastify, request, reply, provider, body);
       }
 
       return jsonCompletion(fastify, request, reply, provider, body);
@@ -89,6 +92,17 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
     }
     if (cached) {
       reply.header('x-cache', 'HIT');
+      const tokens = extractTokens(cached);
+      // why: a cache hit still consumed tokens originally — record it so usage
+      // and cost reflect what the client received (cached = true).
+      request.usage = {
+        provider: provider.name,
+        model: body.model,
+        ...tokens,
+        cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
+        cached: true,
+        status: 200,
+      };
       request.log.info(
         { provider: provider.name, model: body.model, cache: 'HIT' },
         'chat completion (cache hit)',
@@ -131,6 +145,16 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
 
   if (key) reply.header('x-cache', 'MISS');
 
+  const tokens = extractTokens(result.data);
+  request.usage = {
+    provider: provider.name,
+    model: body.model,
+    ...tokens,
+    cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
+    cached: false,
+    status: result.status,
+  };
+
   request.log.info(
     {
       provider: provider.name,
@@ -147,7 +171,7 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
 }
 
 /** Streaming path: pipe the upstream SSE bytes to the client over reply.raw. */
-async function streamCompletion(request, reply, provider, body) {
+async function streamCompletion(fastify, request, reply, provider, body) {
   // why: if the client goes away, abort the upstream fetch so we stop pulling
   // (and paying for) tokens nobody is reading. Listen on the RESPONSE socket
   // (reply.raw), not request.raw — request 'close' fires as soon as the request
@@ -213,11 +237,36 @@ async function streamCompletion(request, reply, provider, body) {
     }
     if (!reply.raw.writableEnded) reply.raw.end();
   } finally {
+    const latencyMs = Date.now() - startedAt;
+    // why: hijacked responses skip the global onResponse hook, so record
+    // metrics + usage here. Token counts aren't parsed from the SSE stream, so
+    // they (and cost) are null — we still capture request count and latency.
+    metrics.recordRequest({
+      route: '/v1/chat/completions',
+      status: 200,
+      latencyMs,
+    });
+    if (request.apiKey) {
+      logUsage(fastify.pg, {
+        apiKeyId: request.apiKey.id,
+        provider: provider.name,
+        model: body.model,
+        tokensIn: null,
+        tokensOut: null,
+        totalTokens: null,
+        latencyMs: Math.round(latencyMs),
+        cost: null,
+        cached: false,
+        status: 200,
+      }).catch((err) =>
+        request.log.error({ err }, 'failed to persist stream usage'),
+      );
+    }
     request.log.info(
       {
         provider: provider.name,
         model: body.model,
-        latencyMs: Date.now() - startedAt,
+        latencyMs,
         stream: true,
         aborted: controller.signal.aborted,
       },
