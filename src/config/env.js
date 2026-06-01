@@ -1,0 +1,46 @@
+import { z } from 'zod';
+
+// why: validate all config at startup so the process crashes immediately on
+// misconfiguration instead of failing deep inside a request later.
+const envSchema = z.object({
+  NODE_ENV: z
+    .enum(['development', 'test', 'production'])
+    .default('development'),
+  HOST: z.string().default('0.0.0.0'),
+  PORT: z.coerce.number().int().positive().default(3000),
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+    .default('info'),
+  // why: defaults point at the local docker-compose services so dev works
+  // out of the box; these aren't connected to until later phases.
+  REDIS_URL: z.string().url().default('redis://localhost:6379'),
+  DATABASE_URL: z
+    .string()
+    .url()
+    .default('postgres://janus:janus@localhost:5432/janus'),
+  // why: Groq is the default upstream (free, fast, OpenAI-compatible). The key
+  // is optional so the server still boots for /health without it; the chat
+  // route reports "no provider configured" at request time when it's missing.
+  GROQ_API_KEY: z.string().optional(),
+  GROQ_BASE_URL: z.string().url().default('https://api.groq.com/openai/v1'),
+});
+
+/**
+ * Parse and validate process.env. Returns a frozen, typed config object.
+ * Throws (and we let it crash the process) when required values are missing
+ * or malformed.
+ */
+export function loadEnv(source = process.env) {
+  const result = envSchema.safeParse(source);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('\n');
+    // why: surface every problem at once, but never echo the env values
+    // themselves (they may contain secrets).
+    throw new Error(`Invalid environment configuration:\n${issues}`);
+  }
+  return Object.freeze(result.data);
+}
+
+export { envSchema };

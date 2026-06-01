@@ -1,4 +1,6 @@
 node_modules/
 .env
+coverage/
+*.log
 CLAUDE.md
 BUILD_PLAN.md
