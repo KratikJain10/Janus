@@ -23,6 +23,13 @@ const envSchema = z.object({
   // route reports "no provider configured" at request time when it's missing.
   GROQ_API_KEY: z.string().optional(),
   GROQ_BASE_URL: z.string().url().default('https://api.groq.com/openai/v1'),
+  // why: exact-match response cache. Accept a boolean or "true"/"false" string
+  // so it works from env vars and from test config alike.
+  CACHE_ENABLED: z
+    .union([z.boolean(), z.enum(['true', 'false'])])
+    .default(true)
+    .transform((v) => v === true || v === 'true'),
+  CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
 });
 
 /**

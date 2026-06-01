@@ -10,3 +10,27 @@ import { createHash } from 'node:crypto';
 export function sha256(input) {
   return createHash('sha256').update(input).digest('hex');
 }
+
+/**
+ * Deterministic JSON: object keys are sorted recursively so that two logically
+ * equal requests serialize identically regardless of key order. Array order is
+ * preserved (it's meaningful, e.g. the messages list).
+ *
+ * why: the cache key must be stable — {a:1,b:2} and {b:2,a:1} must hash the same.
+ */
+export function stableStringify(value) {
+  return JSON.stringify(sortDeep(value));
+}
+
+function sortDeep(value) {
+  if (Array.isArray(value)) return value.map(sortDeep);
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = sortDeep(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}

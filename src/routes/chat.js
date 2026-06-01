@@ -6,6 +6,11 @@ import {
   chatCompletion,
   chatCompletionStream,
 } from '../providers/openaiCompatible.js';
+import {
+  cacheKey,
+  getCachedResponse,
+  setCachedResponse,
+} from '../cache/exactCache.js';
 
 // why: validate the fields the gateway reasons about, but .passthrough() so any
 // other OpenAI parameter (stop, presence_penalty, tools, ...) forwards intact.
@@ -59,16 +64,39 @@ export default async function chatRoutes(fastify) {
       }
 
       if (body.stream) {
+        // why: streaming responses are never cached (can't buffer them, and
+        // the cache stores whole JSON bodies). Phase 2 path, untouched.
         return streamCompletion(request, reply, provider, body);
       }
 
-      return jsonCompletion(request, reply, provider, body);
+      return jsonCompletion(fastify, request, reply, provider, body);
     },
   );
 }
 
-/** Non-streaming path: forward and return the upstream status + body. */
-async function jsonCompletion(request, reply, provider, body) {
+/** Non-streaming path: serve from cache, else forward and cache the result. */
+async function jsonCompletion(fastify, request, reply, provider, body) {
+  const { CACHE_ENABLED, CACHE_TTL_SECONDS } = fastify.config;
+  const key = CACHE_ENABLED ? cacheKey(body, provider.name) : null;
+
+  if (key) {
+    let cached = null;
+    try {
+      cached = await getCachedResponse(fastify.redis, key);
+    } catch (err) {
+      // why: a cache read failure must never break the request — fall through.
+      request.log.warn({ err }, 'cache read failed');
+    }
+    if (cached) {
+      reply.header('x-cache', 'HIT');
+      request.log.info(
+        { provider: provider.name, model: body.model, cache: 'HIT' },
+        'chat completion (cache hit)',
+      );
+      return reply.status(200).send(cached);
+    }
+  }
+
   const startedAt = Date.now();
   let result;
   try {
@@ -87,12 +115,29 @@ async function jsonCompletion(request, reply, provider, body) {
     });
   }
 
+  // why: only cache successful responses — never cache errors.
+  if (key && result.status === 200) {
+    try {
+      await setCachedResponse(
+        fastify.redis,
+        key,
+        result.data,
+        CACHE_TTL_SECONDS,
+      );
+    } catch (err) {
+      request.log.warn({ err }, 'cache write failed');
+    }
+  }
+
+  if (key) reply.header('x-cache', 'MISS');
+
   request.log.info(
     {
       provider: provider.name,
       model: body.model,
       upstreamStatus: result.status,
       latencyMs: Date.now() - startedAt,
+      cache: key ? 'MISS' : 'BYPASS',
     },
     'chat completion',
   );
