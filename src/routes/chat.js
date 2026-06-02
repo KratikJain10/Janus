@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
-import { getDefaultProvider } from '../config/providers.js';
+import { getProviderChain, executeWithFallback } from '../providers/router.js';
 import {
   chatCompletion,
   chatCompletionStream,
@@ -56,8 +56,8 @@ export default async function chatRoutes(fastify) {
       }
       const body = parsed.data;
 
-      const provider = getDefaultProvider(fastify.config);
-      if (!provider) {
+      const providers = getProviderChain(fastify.config);
+      if (providers.length === 0) {
         return reply.status(503).send({
           error: {
             type: 'no_provider',
@@ -69,18 +69,38 @@ export default async function chatRoutes(fastify) {
       if (body.stream) {
         // why: streaming responses are never cached (can't buffer them, and
         // the cache stores whole JSON bodies).
-        return streamCompletion(fastify, request, reply, provider, body);
+        return streamCompletion(fastify, request, reply, providers, body);
       }
 
-      return jsonCompletion(fastify, request, reply, provider, body);
+      return jsonCompletion(fastify, request, reply, providers, body);
     },
   );
 }
 
-/** Non-streaming path: serve from cache, else forward and cache the result. */
-async function jsonCompletion(fastify, request, reply, provider, body) {
+// Build the retry + circuit-breaker options shared by both paths from config.
+function reliabilityOpts(fastify, request) {
+  const c = fastify.config;
+  return {
+    retry: {
+      timeoutMs: c.UPSTREAM_TIMEOUT_MS,
+      retries: c.UPSTREAM_MAX_RETRIES,
+      log: request.log,
+    },
+    fallback: {
+      failureThreshold: c.CIRCUIT_BREAKER_THRESHOLD,
+      cooldownMs: c.CIRCUIT_BREAKER_COOLDOWN_MS,
+      log: request.log,
+    },
+  };
+}
+
+/** Non-streaming path: serve from cache, else forward (with fallback) and cache. */
+async function jsonCompletion(fastify, request, reply, providers, body) {
   const { CACHE_ENABLED, CACHE_TTL_SECONDS } = fastify.config;
-  const key = CACHE_ENABLED ? cacheKey(body, provider.name) : null;
+  // why: namespace the cache by the primary provider; lookup happens before we
+  // know which provider will actually serve.
+  const primary = providers[0];
+  const key = CACHE_ENABLED ? cacheKey(body, primary.name) : null;
 
   if (key) {
     let cached = null;
@@ -96,7 +116,7 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
       // why: a cache hit still consumed tokens originally — record it so usage
       // and cost reflect what the client received (cached = true).
       request.usage = {
-        provider: provider.name,
+        provider: primary.name,
         model: body.model,
         ...tokens,
         cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
@@ -104,27 +124,35 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
         status: 200,
       };
       request.log.info(
-        { provider: provider.name, model: body.model, cache: 'HIT' },
+        { provider: primary.name, model: body.model, cache: 'HIT' },
         'chat completion (cache hit)',
       );
       return reply.status(200).send(cached);
     }
   }
 
+  const { retry, fallback } = reliabilityOpts(fastify, request);
   const startedAt = Date.now();
+
+  let served;
   let result;
   try {
-    result = await chatCompletion(provider, body);
+    // why: try providers in order, each with its own retries; fall back on a
+    // thrown error or a 5xx that exhausted retries.
+    ({ provider: served, result } = await executeWithFallback(
+      providers,
+      (provider) => chatCompletion(provider, body, retry),
+      { ...fallback, isFailure: (r) => r.status >= 500 },
+    ));
   } catch (err) {
-    // why: network/connection failures — retry & fallback come in Phase 5.
-    request.log.error(
-      { err, provider: provider.name },
-      'upstream request failed',
-    );
-    return reply.status(502).send({
+    const allOpen = err.code === 'all_providers_unavailable';
+    request.log.error({ err }, 'all upstream providers failed');
+    return reply.status(allOpen ? 503 : 502).send({
       error: {
         type: 'upstream_error',
-        message: 'failed to reach upstream provider',
+        message: allOpen
+          ? 'all upstream providers are temporarily unavailable'
+          : 'failed to reach any upstream provider',
       },
     });
   }
@@ -144,10 +172,13 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
   }
 
   if (key) reply.header('x-cache', 'MISS');
+  reply.header('x-provider', served.name);
 
+  // why: usage is recorded ONCE here, attributed to the provider that actually
+  // served — retries and fallback below this line don't double-count.
   const tokens = extractTokens(result.data);
   request.usage = {
-    provider: provider.name,
+    provider: served.name,
     model: body.model,
     ...tokens,
     cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
@@ -157,7 +188,7 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
 
   request.log.info(
     {
-      provider: provider.name,
+      provider: served.name,
       model: body.model,
       upstreamStatus: result.status,
       latencyMs: Date.now() - startedAt,
@@ -171,7 +202,7 @@ async function jsonCompletion(fastify, request, reply, provider, body) {
 }
 
 /** Streaming path: pipe the upstream SSE bytes to the client over reply.raw. */
-async function streamCompletion(fastify, request, reply, provider, body) {
+async function streamCompletion(fastify, request, reply, providers, body) {
   // why: if the client goes away, abort the upstream fetch so we stop pulling
   // (and paying for) tokens nobody is reading. Listen on the RESPONSE socket
   // (reply.raw), not request.raw — request 'close' fires as soon as the request
@@ -181,21 +212,33 @@ async function streamCompletion(fastify, request, reply, provider, body) {
     if (!reply.raw.writableEnded) controller.abort();
   });
 
+  const { retry, fallback } = reliabilityOpts(fastify, request);
+
+  let provider;
   let upstream;
   try {
-    upstream = await chatCompletionStream(provider, body, {
-      signal: controller.signal,
-    });
+    // why: retries/fallback apply to ESTABLISHING the stream (before any bytes);
+    // once headers arrive the body streams untouched — you can't retry mid-SSE.
+    ({ provider, result: upstream } = await executeWithFallback(
+      providers,
+      (p) =>
+        chatCompletionStream(p, body, { ...retry, signal: controller.signal }),
+      {
+        ...fallback,
+        signal: controller.signal,
+        isFailure: (res) => !res.ok && res.status >= 500,
+      },
+    ));
   } catch (err) {
     if (controller.signal.aborted) return; // client already disconnected
-    request.log.error(
-      { err, provider: provider.name },
-      'upstream stream failed',
-    );
-    return reply.status(502).send({
+    const allOpen = err.code === 'all_providers_unavailable';
+    request.log.error({ err }, 'all upstream providers failed (stream)');
+    return reply.status(allOpen ? 503 : 502).send({
       error: {
         type: 'upstream_error',
-        message: 'failed to reach upstream provider',
+        message: allOpen
+          ? 'all upstream providers are temporarily unavailable'
+          : 'failed to reach any upstream provider',
       },
     });
   }
@@ -210,6 +253,7 @@ async function streamCompletion(fastify, request, reply, provider, body) {
     } catch {
       data = { error: { type: 'upstream_error', message: text.slice(0, 500) } };
     }
+    reply.header('x-provider', provider.name);
     return reply.status(upstream.status).send(data);
   }
 
@@ -220,6 +264,7 @@ async function streamCompletion(fastify, request, reply, provider, body) {
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no', // disable proxy buffering (e.g. nginx)
+    'x-provider': provider.name,
   });
   // why: flush headers immediately so the client sees the stream open before
   // the first token arrives.

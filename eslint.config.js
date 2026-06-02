@@ -23,6 +23,7 @@ export default [
         clearTimeout: 'readonly',
         fetch: 'readonly',
         AbortController: 'readonly',
+        AbortSignal: 'readonly',
         TextEncoder: 'readonly',
         TextDecoder: 'readonly',
         ReadableStream: 'readonly',

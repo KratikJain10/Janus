@@ -30,6 +30,16 @@ const envSchema = z.object({
     .default(true)
     .transform((v) => v === true || v === 'true'),
   CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  // why: upstream reliability (Phase 5). Per-attempt timeout, retry count, and a
+  // simple per-provider circuit breaker (open after N failures, for a cooldown).
+  UPSTREAM_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  UPSTREAM_MAX_RETRIES: z.coerce.number().int().min(0).default(2),
+  CIRCUIT_BREAKER_THRESHOLD: z.coerce.number().int().positive().default(5),
+  CIRCUIT_BREAKER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(15000),
 });
 
 /**
