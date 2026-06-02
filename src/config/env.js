@@ -23,6 +23,8 @@ const envSchema = z.object({
   // route reports "no provider configured" at request time when it's missing.
   GROQ_API_KEY: z.string().optional(),
   GROQ_BASE_URL: z.string().url().default('https://api.groq.com/openai/v1'),
+  // why: opt-in second provider (local Ollama) for fallback. Unset = Groq only.
+  OLLAMA_BASE_URL: z.string().url().optional(),
   // why: exact-match response cache. Accept a boolean or "true"/"false" string
   // so it works from env vars and from test config alike.
   CACHE_ENABLED: z

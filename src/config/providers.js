@@ -6,13 +6,25 @@
 export function loadProviders(config) {
   const providers = [];
 
-  // why: Phase 1 ships a single default provider (Groq). `models: []` is a
-  // placeholder until Phase 5 uses it for model-based routing.
+  // why: Groq is the primary upstream. `models: []` is a placeholder for
+  // model-aware routing (a later refinement).
   if (config.GROQ_API_KEY) {
     providers.push({
       name: 'groq',
       baseUrl: config.GROQ_BASE_URL,
       apiKey: config.GROQ_API_KEY,
+      models: [],
+    });
+  }
+
+  // why: opt-in local fallback (set OLLAMA_BASE_URL). Ollama's OpenAI-compatible
+  // API ignores the key, but our caller always sends a Bearer header, so use a
+  // harmless placeholder. Order matters: listed after Groq = used as fallback.
+  if (config.OLLAMA_BASE_URL) {
+    providers.push({
+      name: 'ollama',
+      baseUrl: config.OLLAMA_BASE_URL,
+      apiKey: 'ollama',
       models: [],
     });
   }
