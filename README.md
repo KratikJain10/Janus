@@ -114,6 +114,7 @@ Config comes entirely from the environment and is validated by **zod at startup*
 | --- | --- | --- |
 | `GROQ_API_KEY` | — | Primary upstream provider |
 | `OLLAMA_BASE_URL` | — | Opt-in local fallback provider |
+| `GROQ_MODELS` · `OLLAMA_MODELS` | — (wildcard) | Comma-separated models each provider serves; enables model-aware routing |
 | `CACHE_ENABLED` · `CACHE_TTL_SECONDS` | `true` · `300` | Exact-match cache |
 | `UPSTREAM_TIMEOUT_MS` · `UPSTREAM_MAX_RETRIES` | `30000` · `2` | Retry policy |
 | `CIRCUIT_BREAKER_THRESHOLD` · `_COOLDOWN_MS` | `5` · `15000` | Per-provider circuit breaker |
@@ -125,9 +126,10 @@ A few choices worth calling out (the kind of thing this project is meant to demo
 
 - **Fastify over Express** — lower per-request overhead for a throughput-oriented proxy, first-class streaming, and built-in pino logging + schema support.
 - **Token bucket in one Lua script** — the entire check-refill-decrement runs server-side in Redis, so rate limiting stays correct under concurrent requests with no round-trip races.
-- **Usage logged once, after fallback** — retries and provider fallback happen *below* the usage layer, so a request that fails over to a backup is billed once, to the provider that actually served it.
+- **Usage logged once, after fallback** — retries and provider fallback happen *below* the usage layer, so a request that fails over to a backup is billed once, to the provider that actually served it. Cache entries store the serving provider too, so a cache hit is attributed to whoever originally produced it.
+- **Model-aware routing** — providers declare the models they serve (empty = wildcard); the router restricts the fallback chain to providers that can serve the requested model, so you can point a model at a specific upstream without taking another offline to force failover.
 - **Fail-open caches, fail-fast config** — a Redis/embedding hiccup degrades to a normal upstream call rather than erroring; bad configuration crashes the process immediately at boot.
-- **Streaming without buffering** — the upstream SSE stream is piped straight to the socket with backpressure; client disconnects abort the upstream so we stop paying for unread tokens.
+- **Streaming without buffering** — the upstream SSE stream is piped straight to the socket with backpressure; client disconnects abort the upstream so we stop paying for unread tokens. A passthrough tap reads the final `usage` chunk (via `stream_options.include_usage`) so streamed requests get exact token + cost accounting without buffering the response.
 
 ## Testing
 
@@ -136,7 +138,20 @@ npm test      # vitest — uses fastify.inject() with injected pg/redis fakes (n
 npm run lint  # eslint
 ```
 
-62 tests cover the proxy, streaming, auth, rate limiting, both cache layers, retry/fallback/circuit-breaker semantics, cost computation, and the usage/metrics endpoints.
+72 tests cover the proxy, streaming (incl. streamed token capture), auth, rate limiting, both cache layers, model-aware routing, retry/fallback/circuit-breaker semantics, cost computation, and the usage/metrics endpoints.
+
+## Benchmarks
+
+Measured locally (single Node process, Groq `llama-3.1-8b-instant`) — full method + raw output in [`bench/RESULTS.md`](bench/RESULTS.md):
+
+| Path | Throughput | p50 | p99 |
+| --- | --- | --- | --- |
+| **Cached** (gateway + Redis) | **1,542 req/s** | ~32 ms | 64 ms |
+| **Uncached** (gateway → Groq) | upstream-bound¹ | 243 ms | 644 ms² |
+
+At a **99.996%** cache hit ratio over a 15s run, hits returned ~8× faster than live calls and avoided ~all repeat upstream cost. Reproduce with `BENCH_KEY=jns_... bench/run.sh`.
+
+¹ Uncached throughput is capped by Groq's free-tier tokens/min, not the gateway. ² p95 (autocannon/driver percentile).
 
 ## Project layout
 
@@ -153,16 +168,17 @@ src/
   lib/                   http (timeout/retry), hash, metrics
   db/migrations/         plain .sql + a tiny migrate runner
 public/                  dashboard (no-build React via CDN)
+bench/                   load-test drivers + measured results
 test/                    vitest suites
 ```
 
 ## Roadmap
 
-Backend is feature-complete. Natural next steps:
+Backend is feature-complete, including model-aware routing, provider-attributed cache entries, and exact streamed-usage accounting. Natural next steps:
 
-- Model-aware routing (map models → providers) so fallback works without forcing the primary offline
-- Store the serving provider in cache entries so cache-hit usage is attributed precisely
-- Capture token counts from streaming responses for exact streamed-usage accounting
+- Per-key model/route allow-lists and budget caps (hard spend limits, not just tracking)
+- Weighted / latency-aware provider selection instead of fixed config order
+- Half-open circuit-breaker probes so a recovered provider is retried before full cooldown elapses
 
 ## License
 

@@ -193,6 +193,82 @@ describe('POST /v1/chat/completions', () => {
     expect(res.json().error.type).toBe('upstream_error');
   });
 
+  it('captures token counts from a streaming response and persists usage', async () => {
+    const chunks = [
+      'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    const pg = fakePg();
+    await app.close();
+    const config = loadEnv({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      GROQ_API_KEY: 'gsk_test_key',
+    });
+    app = buildApp(config, { pg, redis: fakeRedis() });
+    await app.ready();
+    fetchMock.mockResolvedValue({ ok: true, status: 200, body: sseStream(chunks) });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: authHeader(),
+      payload: {
+        model: 'llama-3.1-8b-instant',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+
+    // upstream was asked to include usage in the stream
+    const [, opts] = fetchMock.mock.calls[0];
+    expect(JSON.parse(opts.body).stream_options).toMatchObject({
+      include_usage: true,
+    });
+
+    // why: usage is persisted asynchronously after the stream ends — let the
+    // microtask/IO settle, then assert the row carried real token counts.
+    await new Promise((r) => setTimeout(r, 20));
+    const insert = pg.query.mock.calls.find(([sql]) =>
+      /insert into usage_logs/i.test(sql),
+    );
+    expect(insert).toBeTruthy();
+    const params = insert[1];
+    // columns: api_key_id, provider, model, tokens_in, tokens_out, total_tokens, ...
+    expect(params[3]).toBe(9); // tokens_in
+    expect(params[4]).toBe(4); // tokens_out
+    expect(params[5]).toBe(13); // total_tokens
+  });
+
+  it('returns 404 when no configured provider serves the model', async () => {
+    // scope Groq to a specific model so an unknown model has no provider
+    await app.close();
+    const config = loadEnv({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      GROQ_API_KEY: 'gsk_test_key',
+      GROQ_MODELS: 'llama-3.1-8b-instant',
+    });
+    app = buildApp(config, { pg: fakePg(), redis: fakeRedis() });
+    await app.ready();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: authHeader(),
+      payload: {
+        model: 'unsupported-model',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.type).toBe('model_not_found');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('returns 503 when no provider is configured', async () => {
     // rebuild app without a provider key
     await app.close();

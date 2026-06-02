@@ -6,14 +6,14 @@
 export function loadProviders(config) {
   const providers = [];
 
-  // why: Groq is the primary upstream. `models: []` is a placeholder for
-  // model-aware routing (a later refinement).
+  // why: Groq is the primary upstream. `models` declares which models it serves
+  // (empty = wildcard); see getProviderChain for how routing uses it.
   if (config.GROQ_API_KEY) {
     providers.push({
       name: 'groq',
       baseUrl: config.GROQ_BASE_URL,
       apiKey: config.GROQ_API_KEY,
-      models: [],
+      models: parseModels(config.GROQ_MODELS),
     });
   }
 
@@ -25,11 +25,21 @@ export function loadProviders(config) {
       name: 'ollama',
       baseUrl: config.OLLAMA_BASE_URL,
       apiKey: 'ollama',
-      models: [],
+      models: parseModels(config.OLLAMA_MODELS),
     });
   }
 
   return providers;
+}
+
+// why: models come from env as a comma-separated string; normalize to a trimmed,
+// non-empty array. Unset/blank -> [] which means "serves any model" (wildcard).
+function parseModels(csv) {
+  if (!csv) return [];
+  return csv
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /** The provider a request goes to when no routing logic exists yet. */

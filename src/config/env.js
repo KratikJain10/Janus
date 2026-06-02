@@ -24,8 +24,13 @@ const envSchema = z
     // route reports "no provider configured" at request time when it's missing.
     GROQ_API_KEY: z.string().optional(),
     GROQ_BASE_URL: z.string().url().default('https://api.groq.com/openai/v1'),
+    // why: optional model-aware routing. Comma-separated model ids this provider
+    // serves; empty/unset = wildcard (serves any model). Lets you route a model
+    // to a specific provider — and exercise fallback — without taking one offline.
+    GROQ_MODELS: z.string().optional(),
     // why: opt-in second provider (local Ollama) for fallback. Unset = Groq only.
     OLLAMA_BASE_URL: z.string().url().optional(),
+    OLLAMA_MODELS: z.string().optional(),
     // why: exact-match response cache. Accept a boolean or "true"/"false" string
     // so it works from env vars and from test config alike.
     CACHE_ENABLED: z

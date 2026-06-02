@@ -6,10 +6,20 @@ const breakers = new Map();
 
 /**
  * The ordered list of providers to try for a request. Primary first, then
- * fallbacks (config order). Model-aware routing can refine this later.
+ * fallbacks (config order).
+ *
+ * When `model` is given, restrict the chain to providers that can serve it:
+ * a provider with an empty `models` list is a wildcard (serves anything), while
+ * one that declares models only matches those. This is model-aware routing — it
+ * lets you point a model at a specific provider (and still get fallback among the
+ * providers that serve it) without taking the primary offline to force failover.
  */
-export function getProviderChain(config) {
-  return loadProviders(config);
+export function getProviderChain(config, model) {
+  const providers = loadProviders(config);
+  if (!model) return providers;
+  return providers.filter(
+    (p) => p.models.length === 0 || p.models.includes(model),
+  );
 }
 
 function isBreakerOpen(name, now) {

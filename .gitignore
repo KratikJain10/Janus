@@ -4,3 +4,4 @@ coverage/
 *.log
 CLAUDE.md
 BUILD_PLAN.md
+bench/results/

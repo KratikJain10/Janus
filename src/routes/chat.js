@@ -20,6 +20,7 @@ import {
 import { computeCost } from '../usage/cost.js';
 import { logUsage, extractTokens } from '../usage/logger.js';
 import { metrics } from '../lib/metrics.js';
+import { createUsageTap } from '../lib/sseUsage.js';
 
 // why: validate the fields the gateway reasons about, but .passthrough() so any
 // other OpenAI parameter (stop, presence_penalty, tools, ...) forwards intact.
@@ -62,12 +63,22 @@ export default async function chatRoutes(fastify) {
       }
       const body = parsed.data;
 
-      const providers = getProviderChain(fastify.config);
-      if (providers.length === 0) {
+      // why: distinguish "nothing configured" (503, an ops problem) from "no
+      // configured provider serves this model" (404, a client problem).
+      if (getProviderChain(fastify.config).length === 0) {
         return reply.status(503).send({
           error: {
             type: 'no_provider',
             message: 'no upstream provider configured',
+          },
+        });
+      }
+      const providers = getProviderChain(fastify.config, body.model);
+      if (providers.length === 0) {
+        return reply.status(404).send({
+          error: {
+            type: 'model_not_found',
+            message: `no provider serves model '${body.model}'`,
           },
         });
       }
@@ -117,13 +128,19 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
       request.log.warn({ err }, 'cache read failed');
     }
     if (cached) {
+      // why: entries are stored as { provider, response } so a hit is attributed
+      // to the provider that actually produced the response — not just the
+      // namespace provider. Legacy entries (raw response) fall back to primary.
+      const servedProvider = cached.provider ?? primary.name;
+      const responseBody = cached.response ?? cached;
       reply.header('x-cache', 'HIT');
       reply.header('x-cache-type', 'exact');
-      const tokens = extractTokens(cached);
+      reply.header('x-provider', servedProvider);
+      const tokens = extractTokens(responseBody);
       // why: a cache hit still consumed tokens originally — record it so usage
       // and cost reflect what the client received (cached = true).
       request.usage = {
-        provider: primary.name,
+        provider: servedProvider,
         model: body.model,
         ...tokens,
         cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
@@ -131,10 +148,10 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
         status: 200,
       };
       request.log.info(
-        { provider: primary.name, model: body.model, cache: 'HIT' },
+        { provider: servedProvider, model: body.model, cache: 'HIT' },
         'chat completion (cache hit)',
       );
-      return reply.status(200).send(cached);
+      return reply.status(200).send(responseBody);
     }
   }
 
@@ -209,13 +226,15 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
     });
   }
 
-  // why: only cache successful responses — never cache errors.
+  // why: only cache successful responses — never cache errors. Store the serving
+  // provider alongside the body so cache-hit usage is attributed to whoever
+  // actually produced it (which may be a fallback, not the namespace provider).
   if (key && result.status === 200) {
     try {
       await setCachedResponse(
         fastify.redis,
         key,
-        result.data,
+        { provider: served.name, response: result.data },
         CACHE_TTL_SECONDS,
       );
     } catch (err) {
@@ -282,6 +301,14 @@ async function streamCompletion(fastify, request, reply, providers, body) {
 
   const { retry, fallback } = reliabilityOpts(fastify, request);
 
+  // why: ask the upstream to emit a final usage chunk so we can record exact
+  // token counts for a streamed response. Merge over any client stream_options
+  // but force include_usage on — we need it for accounting and cost.
+  const upstreamBody = {
+    ...body,
+    stream_options: { ...(body.stream_options ?? {}), include_usage: true },
+  };
+
   let provider;
   let upstream;
   try {
@@ -290,7 +317,10 @@ async function streamCompletion(fastify, request, reply, providers, body) {
     ({ provider, result: upstream } = await executeWithFallback(
       providers,
       (p) =>
-        chatCompletionStream(p, body, { ...retry, signal: controller.signal }),
+        chatCompletionStream(p, upstreamBody, {
+          ...retry,
+          signal: controller.signal,
+        }),
       {
         ...fallback,
         signal: controller.signal,
@@ -339,10 +369,13 @@ async function streamCompletion(fastify, request, reply, providers, body) {
   reply.raw.flushHeaders?.();
 
   const startedAt = Date.now();
+  // why: tap the stream for the final usage chunk without buffering or delaying
+  // it — gives exact streamed-token accounting in the finally block below.
+  const { transform: usageTap, getUsage } = createUsageTap();
   try {
     // why: pipeline streams chunks through with backpressure and no buffering,
     // and ends reply.raw when the upstream completes.
-    await pipeline(Readable.fromWeb(upstream.body), reply.raw);
+    await pipeline(Readable.fromWeb(upstream.body), usageTap, reply.raw);
   } catch (err) {
     // why: a client disconnect mid-stream is expected, not an error to alarm on.
     if (!controller.signal.aborted) {
@@ -351,24 +384,23 @@ async function streamCompletion(fastify, request, reply, providers, body) {
     if (!reply.raw.writableEnded) reply.raw.end();
   } finally {
     const latencyMs = Date.now() - startedAt;
-    // why: hijacked responses skip the global onResponse hook, so record
-    // metrics + usage here. Token counts aren't parsed from the SSE stream, so
-    // they (and cost) are null — we still capture request count and latency.
+    // why: hijacked responses skip the global onResponse hook, so record metrics
+    // + usage here. Token counts come from the SSE usage chunk captured by the
+    // tap (null only if the client disconnected before it arrived).
     metrics.recordRequest({
       route: '/v1/chat/completions',
       status: 200,
       latencyMs,
     });
+    const tokens = extractTokens({ usage: getUsage() });
     if (request.apiKey) {
       logUsage(fastify.pg, {
         apiKeyId: request.apiKey.id,
         provider: provider.name,
         model: body.model,
-        tokensIn: null,
-        tokensOut: null,
-        totalTokens: null,
+        ...tokens,
         latencyMs: Math.round(latencyMs),
-        cost: null,
+        cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
         cached: false,
         status: 200,
       }).catch((err) =>
@@ -381,6 +413,8 @@ async function streamCompletion(fastify, request, reply, providers, body) {
         model: body.model,
         latencyMs,
         stream: true,
+        tokensIn: tokens.tokensIn,
+        tokensOut: tokens.tokensOut,
         aborted: controller.signal.aborted,
       },
       'chat completion (stream)',
