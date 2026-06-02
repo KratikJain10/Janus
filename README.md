@@ -1,118 +1,169 @@
+<div align="center">
+
 # Janus
 
-A self-hostable, OpenAI-compatible **LLM API gateway**. Clients call one endpoint; Janus adds the production concerns every AI app needs but shouldn't rebuild: auth, rate limiting, caching, retries/fallback across providers, and per-key cost + usage tracking.
+**A self-hostable, OpenAI-compatible LLM API gateway.**
 
-Named after the Roman god of gates and transitions — apt for an API gateway.
+One endpoint in front of any LLM provider — with the auth, rate limiting, caching, reliability, and cost tracking that production AI apps need but shouldn't rebuild.
 
-## Why
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![Fastify](https://img.shields.io/badge/built%20with-Fastify-000000?logo=fastify&logoColor=white)](https://fastify.dev)
+[![Tests](https://img.shields.io/badge/tests-62%20passing-brightgreen?logo=vitest&logoColor=white)](#testing)
+[![Code style](https://img.shields.io/badge/code%20style-prettier-ff69b4?logo=prettier&logoColor=white)](https://prettier.io)
+[![License](https://img.shields.io/badge/license-ISC-blue)](#license)
 
-Real AI products don't call provider APIs directly — they put a gateway in front to control cost, add reliability, and observe usage. Janus implements that gateway from scratch to demonstrate practical backend engineering (proxying, streaming, caching, rate limiting, failure handling, observability) — not to call an LLM API.
+</div>
 
-## Features
+---
 
-- **OpenAI-compatible** `POST /v1/chat/completions`, streaming (`stream: true`) and non-streaming
-- **Auth** — client API keys stored as SHA-256 hashes in Postgres
-- **Rate limiting** — per-key token bucket in Redis, atomic via a single Lua script
-- **Exact-match cache** — normalized + hashed requests cached in Redis with TTL
-- **Semantic cache** *(optional)* — embed the prompt, pgvector cosine search, serve near-duplicate prompts above a similarity threshold
-- **Reliability** — retry (timeout / 5xx / connection errors) with capped backoff + jitter, fallback to the next provider, per-provider circuit breaker
-- **Observability** — per-request usage + cost in Postgres, `GET /v1/usage`, Prometheus `GET /metrics`, and a minimal `/dashboard`
-- **Provider-agnostic** — a provider is just config `{ name, baseUrl, apiKey }`; adding one = adding config, not code
+## Why this exists
+
+Real AI products rarely call provider APIs directly. They put a **gateway** in front to control cost, add reliability, and observe usage. Janus implements that gateway from scratch — the interesting engineering is the proxying, streaming, caching, rate limiting, failure handling, and observability, *not* the LLM call itself.
+
+Named after the Roman god of gates, doorways, and transitions. 🏛️
+
+## Highlights
+
+- 🔌 **Drop-in OpenAI compatibility** — `POST /v1/chat/completions`, streaming and non-streaming. Point your existing OpenAI SDK at it.
+- 🔑 **API-key auth** — client keys stored as SHA-256 hashes in Postgres (the plaintext key is shown once, never stored).
+- 🚦 **Per-key rate limiting** — token bucket in Redis, evaluated atomically in a single Lua script so it's correct under concurrency.
+- ⚡ **Two-layer caching** — exact-match (Redis, hashed request) and optional **semantic** (pgvector cosine search) that serves near-duplicate prompts.
+- 🛟 **Reliability** — per-attempt timeout, retries with capped exponential backoff + jitter, automatic **fallback** to the next provider, and a per-provider **circuit breaker**.
+- 📊 **Observability** — per-request tokens/latency/cost persisted to Postgres, a `/v1/usage` summary, Prometheus `/metrics`, and a minimal `/dashboard`.
+- 🧩 **Provider-agnostic** — a provider is just config `{ name, baseUrl, apiKey }`. Adding one is config, not code.
 
 ## Architecture
 
 ```
 Client
-  -> Fastify
-  -> auth hook         (validate client API key from Postgres)
-  -> rate-limit hook   (token bucket in Redis, atomic Lua)
-  -> exact cache       (Redis)            --hit--> return
-  -> semantic cache    (pgvector)         --hit--> return
-  -> router            (pick provider + fallback order, circuit breaker)
-  -> upstream call     (fetch w/ timeout -> retry+backoff -> fallback)
-  -> response          (SSE stream OR JSON)
-  -> onResponse        (log tokens/latency/cost to Postgres; record metrics)
+  │
+  ▼
+Fastify
+  ├─ auth hook          validate client API key (Postgres)
+  ├─ rate-limit hook    token bucket in Redis (atomic Lua)
+  ├─ exact cache        Redis, hashed request           ──hit──▶ return
+  ├─ semantic cache     pgvector cosine similarity       ──hit──▶ return
+  ├─ router             pick provider + fallback order, circuit breaker
+  │     └─ upstream     fetch( timeout → retry+backoff → fallback )
+  ├─ response           SSE stream  OR  JSON
+  └─ onResponse         persist tokens/latency/cost; record metrics
 ```
+
+Auth and rate limiting are Fastify `preHandler` plugins; Redis and the Postgres pool are exposed via decorator plugins (`fastify.redis`, `fastify.pg`). The app is built (`buildApp`) separately from the server (`server.js`) so tests run against the real app via `fastify.inject()`.
 
 ## Tech stack
 
-Node.js (ESM) · Fastify · pino · Redis · PostgreSQL (`pg`, raw SQL) + pgvector · zod · undici/`fetch` · vitest · ESLint + Prettier · Docker Compose.
+**Node.js** (ES modules) · **Fastify** · **pino** · **Redis** · **PostgreSQL** (`pg`, raw SQL) + **pgvector** · **zod** · native `fetch`/**undici** · **vitest** · **ESLint** + **Prettier** · **Docker Compose**.
 
 ## Quick start
 
 ```bash
-# 1. Backing services (Redis + Postgres with pgvector)
+# 1 — backing services (Redis + Postgres-with-pgvector)
 docker compose up -d
 
-# 2. Config
-cp .env.example .env        # add your GROQ_API_KEY
+# 2 — configure
+cp .env.example .env          # set GROQ_API_KEY (free tier at console.groq.com)
 
-# 3. Schema + an API key
+# 3 — install, migrate, mint a client key
 npm install
 npm run migrate
-npm run mint-key -- --name dev --rpm 100   # prints a jns_... key once
+npm run mint-key -- --name dev --rpm 100      # prints a jns_… key ONCE
 
-# 4. Run
-npm run dev                  # loads .env via --env-file
+# 4 — run (loads .env via --env-file)
+npm run dev
 ```
+
+### Make a request
 
 ```bash
-# Call it
-curl -s http://localhost:3000/v1/chat/completions \
+curl http://localhost:3000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -H 'authorization: Bearer jns_...' \
-  -d '{"model":"llama-3.1-8b-instant","messages":[{"role":"user","content":"hello"}]}'
+  -H 'authorization: Bearer jns_your_key' \
+  -d '{
+    "model": "llama-3.1-8b-instant",
+    "messages": [{ "role": "user", "content": "Say hello in one sentence." }]
+  }'
 ```
+
+Streaming is the same call with `"stream": true` — tokens arrive as Server-Sent Events:
+
+```bash
+curl -N http://localhost:3000/v1/chat/completions \
+  -H 'content-type: application/json' -H 'authorization: Bearer jns_your_key' \
+  -d '{"model":"llama-3.1-8b-instant","stream":true,
+       "messages":[{"role":"user","content":"Count to five."}]}'
+```
+
+Responses carry gateway headers: `x-cache` (`HIT`/`MISS`), `x-cache-type` (`exact`/`semantic`), and `x-provider` (which upstream actually served the request).
 
 ## Endpoints
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| POST | `/v1/chat/completions` | key | OpenAI-compatible; supports `stream: true` |
-| GET | `/v1/usage` | key | Per-key usage + cost summary |
-| GET | `/metrics` | — | Prometheus exposition format |
-| GET | `/dashboard` | — | Minimal usage/metrics UI (prompts for a key) |
-| GET | `/health` | — | Liveness |
-
-Response headers include `x-cache` (HIT/MISS), `x-cache-type` (exact/semantic), and `x-provider` (which upstream served).
+| --- | --- | :---: | --- |
+| `POST` | `/v1/chat/completions` | 🔑 | OpenAI-compatible; supports `stream: true` |
+| `GET` | `/v1/usage` | 🔑 | Per-key usage + cost summary (totals + by-model) |
+| `GET` | `/metrics` | — | Prometheus exposition (requests, latency histogram, cache hit ratio) |
+| `GET` | `/dashboard` | — | Minimal web UI over `/v1/usage` + `/metrics` |
+| `GET` | `/health` | — | Liveness |
 
 ## Configuration
 
-All config is env, validated by zod at startup (the process fails fast on bad/missing values). See [.env.example](.env.example). Highlights:
+Config comes entirely from the environment and is validated by **zod at startup** — the process fails fast with a clear message on anything missing or malformed (and never echoes secret values). Full list in [`.env.example`](.env.example); the essentials:
 
-| Var | Default | Purpose |
-|---|---|---|
-| `GROQ_API_KEY` | — | Primary provider key |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GROQ_API_KEY` | — | Primary upstream provider |
 | `OLLAMA_BASE_URL` | — | Opt-in local fallback provider |
-| `CACHE_ENABLED` / `CACHE_TTL_SECONDS` | `true` / `300` | Exact-match cache |
-| `UPSTREAM_TIMEOUT_MS` / `UPSTREAM_MAX_RETRIES` | `30000` / `2` | Retry policy |
-| `CIRCUIT_BREAKER_THRESHOLD` / `_COOLDOWN_MS` | `5` / `15000` | Circuit breaker |
-| `SEMANTIC_CACHE_ENABLED` / `_THRESHOLD` | `false` / `0.95` | Semantic cache (needs `EMBEDDING_BASE_URL`) |
+| `CACHE_ENABLED` · `CACHE_TTL_SECONDS` | `true` · `300` | Exact-match cache |
+| `UPSTREAM_TIMEOUT_MS` · `UPSTREAM_MAX_RETRIES` | `30000` · `2` | Retry policy |
+| `CIRCUIT_BREAKER_THRESHOLD` · `_COOLDOWN_MS` | `5` · `15000` | Per-provider circuit breaker |
+| `SEMANTIC_CACHE_ENABLED` · `_THRESHOLD` | `false` · `0.95` | Semantic cache (requires `EMBEDDING_BASE_URL`) |
 
-## Development
+## Design decisions
+
+A few choices worth calling out (the kind of thing this project is meant to demonstrate):
+
+- **Fastify over Express** — lower per-request overhead for a throughput-oriented proxy, first-class streaming, and built-in pino logging + schema support.
+- **Token bucket in one Lua script** — the entire check-refill-decrement runs server-side in Redis, so rate limiting stays correct under concurrent requests with no round-trip races.
+- **Usage logged once, after fallback** — retries and provider fallback happen *below* the usage layer, so a request that fails over to a backup is billed once, to the provider that actually served it.
+- **Fail-open caches, fail-fast config** — a Redis/embedding hiccup degrades to a normal upstream call rather than erroring; bad configuration crashes the process immediately at boot.
+- **Streaming without buffering** — the upstream SSE stream is piped straight to the socket with backpressure; client disconnects abort the upstream so we stop paying for unread tokens.
+
+## Testing
 
 ```bash
-npm test         # vitest (fastify.inject + injected fakes — no live infra needed)
-npm run lint     # eslint
-npm run format   # prettier
+npm test      # vitest — uses fastify.inject() with injected pg/redis fakes (no live infra)
+npm run lint  # eslint
 ```
+
+62 tests cover the proxy, streaming, auth, rate limiting, both cache layers, retry/fallback/circuit-breaker semantics, cost computation, and the usage/metrics endpoints.
 
 ## Project layout
 
 ```
 src/
-  server.js / app.js     # bootstrap + assemble Fastify
-  config/                # env + provider config (zod)
-  plugins/               # redis, pg, auth, rateLimit (decorators / hooks)
-  routes/                # chat, usage, metrics, health, dashboard
-  providers/             # router (fallback + breaker) + openai-compatible call
-  cache/                 # exact (Redis) + semantic (pgvector)
-  ratelimit/             # token bucket + Lua
-  usage/                 # cost table + usage logger
-  lib/                   # http (retry), hash, metrics
-  db/migrations/         # plain .sql + a tiny migrate runner
+  server.js / app.js     bootstrap + assemble Fastify
+  config/                env + provider config (zod)
+  plugins/               redis, pg, auth, rateLimit  (decorators / preHandlers)
+  routes/                chat, usage, metrics, health, dashboard
+  providers/             router (fallback + breaker) + OpenAI-compatible call
+  cache/                 exact (Redis) + semantic (pgvector)
+  ratelimit/             token bucket + embedded Lua
+  usage/                 model price table + usage logger
+  lib/                   http (timeout/retry), hash, metrics
+  db/migrations/         plain .sql + a tiny migrate runner
+public/                  dashboard (no-build React via CDN)
+test/                    vitest suites
 ```
+
+## Roadmap
+
+Backend is feature-complete. Natural next steps:
+
+- Model-aware routing (map models → providers) so fallback works without forcing the primary offline
+- Store the serving provider in cache entries so cache-hit usage is attributed precisely
+- Capture token counts from streaming responses for exact streamed-usage accounting
 
 ## License
 
-ISC
+[ISC](LICENSE)
