@@ -11,6 +11,12 @@ import {
   getCachedResponse,
   setCachedResponse,
 } from '../cache/exactCache.js';
+import {
+  buildPromptText,
+  embedText,
+  findSimilar,
+  storeEmbedding,
+} from '../cache/semanticCache.js';
 import { computeCost } from '../usage/cost.js';
 import { logUsage, extractTokens } from '../usage/logger.js';
 import { metrics } from '../lib/metrics.js';
@@ -112,6 +118,7 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
     }
     if (cached) {
       reply.header('x-cache', 'HIT');
+      reply.header('x-cache-type', 'exact');
       const tokens = extractTokens(cached);
       // why: a cache hit still consumed tokens originally — record it so usage
       // and cost reflect what the client received (cached = true).
@@ -132,6 +139,51 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
   }
 
   const { retry, fallback } = reliabilityOpts(fastify, request);
+
+  // Phase 7: semantic (near-duplicate) cache — after an exact-cache miss, embed
+  // the prompt and serve the nearest stored response if it's similar enough.
+  const semanticEnabled = fastify.config.SEMANTIC_CACHE_ENABLED;
+  let promptText = null;
+  let embedding = null;
+  if (semanticEnabled) {
+    try {
+      promptText = buildPromptText(body);
+      embedding = await embedText(promptText, fastify.config, retry);
+      const hit = await findSimilar(fastify.pg, {
+        provider: primary.name,
+        model: body.model,
+        embedding,
+        threshold: fastify.config.SEMANTIC_CACHE_THRESHOLD,
+      });
+      if (hit) {
+        reply.header('x-cache', 'HIT');
+        reply.header('x-cache-type', 'semantic');
+        reply.header('x-cache-similarity', hit.similarity.toFixed(4));
+        const tokens = extractTokens(hit.response);
+        request.usage = {
+          provider: primary.name,
+          model: body.model,
+          ...tokens,
+          cost: computeCost(body.model, tokens.tokensIn, tokens.tokensOut),
+          cached: true,
+          status: 200,
+        };
+        request.log.info(
+          {
+            provider: primary.name,
+            model: body.model,
+            similarity: hit.similarity,
+          },
+          'chat completion (semantic cache hit)',
+        );
+        return reply.status(200).send(hit.response);
+      }
+    } catch (err) {
+      // why: embedding/search failures must never break the request — fall through.
+      request.log.warn({ err }, 'semantic cache lookup failed; continuing');
+    }
+  }
+
   const startedAt = Date.now();
 
   let served;
@@ -168,6 +220,22 @@ async function jsonCompletion(fastify, request, reply, providers, body) {
       );
     } catch (err) {
       request.log.warn({ err }, 'cache write failed');
+    }
+  }
+
+  // why: store the embedding + response so future near-duplicate prompts hit.
+  // Reuses the embedding computed during lookup — no second embed call.
+  if (semanticEnabled && embedding && result.status === 200) {
+    try {
+      await storeEmbedding(fastify.pg, {
+        provider: primary.name,
+        model: body.model,
+        prompt: promptText,
+        embedding,
+        response: result.data,
+      });
+    } catch (err) {
+      request.log.warn({ err }, 'semantic cache store failed');
     }
   }
 
