@@ -7,6 +7,7 @@ import healthRoutes from './routes/health.js';
 import chatRoutes from './routes/chat.js';
 import usageRoutes from './routes/usage.js';
 import metricsRoutes from './routes/metrics.js';
+import dashboardRoutes from './routes/dashboard.js';
 import { metrics } from './lib/metrics.js';
 import { logUsage } from './usage/logger.js';
 
@@ -84,6 +85,7 @@ export function buildApp(config, deps = {}) {
   app.register(chatRoutes);
   app.register(usageRoutes);
   app.register(metricsRoutes);
+  app.register(dashboardRoutes);
 
   return app;
 }

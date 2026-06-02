@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Janus — Dashboard</title>
+    <style>
+      :root { --bg:#0f1115; --card:#1a1d24; --line:#2a2f3a; --fg:#e6e9ef; --mut:#8b93a7; --acc:#6ea8fe; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
+      .wrap { max-width:880px; margin:0 auto; padding:28px 20px 60px; }
+      h1 { font-size:22px; margin:0 0 2px; }
+      h1 span { color:var(--acc); }
+      .sub { color:var(--mut); margin:0 0 22px; }
+      .bar { display:flex; gap:8px; margin-bottom:22px; }
+      input { flex:1; background:var(--card); border:1px solid var(--line); color:var(--fg); padding:9px 12px; border-radius:8px; font:inherit; }
+      button { background:var(--acc); color:#0b1220; border:0; padding:9px 16px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
+      button:disabled { opacity:.5; cursor:default; }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:22px; }
+      .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+      .card .label { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+      .card .val { font-size:22px; font-weight:600; margin-top:4px; }
+      h2 { font-size:14px; color:var(--mut); text-transform:uppercase; letter-spacing:.04em; margin:24px 0 10px; }
+      table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+      th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); }
+      th { color:var(--mut); font-weight:600; font-size:12px; }
+      tr:last-child td { border-bottom:0; }
+      td.num,th.num { text-align:right; font-variant-numeric:tabular-nums; }
+      .err { color:#ff6b6b; margin:8px 0; }
+      pre { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; overflow:auto; max-height:280px; color:var(--mut); font-size:12px; }
+      .foot { color:var(--mut); margin-top:28px; font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React, { useState, useEffect, useCallback } from 'https://esm.sh/react@18.3.1';
+      import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';
+      import htm from 'https://esm.sh/htm@3.1.1';
+      const html = htm.bind(React.createElement);
+
+      // Pull a couple of headline numbers out of the Prometheus text.
+      function parseMetrics(text) {
+        let requests = 0, hitRatio = null;
+        for (const line of text.split('\n')) {
+          if (line.startsWith('janus_requests_total{')) requests += Number(line.split(' ').pop());
+          if (line.startsWith('janus_cache_hit_ratio ')) hitRatio = Number(line.split(' ')[1]);
+        }
+        return { requests, hitRatio };
+      }
+      const money = (n) => '$' + Number(n || 0).toFixed(6);
+
+      function Stat({ label, value }) {
+        return html`<div class="card"><div class="label">${label}</div><div class="val">${value}</div></div>`;
+      }
+
+      function App() {
+        const [key, setKey] = useState(localStorage.getItem('janusKey') || '');
+        const [usage, setUsage] = useState(null);
+        const [metrics, setMetrics] = useState(null);
+        const [raw, setRaw] = useState('');
+        const [err, setErr] = useState('');
+        const [loading, setLoading] = useState(false);
+
+        const load = useCallback(async () => {
+          setErr(''); setLoading(true);
+          try {
+            // /metrics is public; /v1/usage needs the API key.
+            const mRes = await fetch('/metrics');
+            const mText = await mRes.text();
+            setRaw(mText); setMetrics(parseMetrics(mText));
+
+            if (key) {
+              localStorage.setItem('janusKey', key);
+              const uRes = await fetch('/v1/usage', { headers: { authorization: 'Bearer ' + key } });
+              if (!uRes.ok) throw new Error('usage: HTTP ' + uRes.status + ' (check your API key)');
+              setUsage(await uRes.json());
+            }
+          } catch (e) {
+            setErr(e.message);
+          } finally {
+            setLoading(false);
+          }
+        }, [key]);
+
+        useEffect(() => { load(); }, []); // initial metrics load
+
+        const t = usage?.totals;
+        return html`
+          <div class="wrap">
+            <h1><span>Janus</span> Dashboard</h1>
+            <p class="sub">Usage &amp; metrics for your LLM gateway.</p>
+
+            <div class="bar">
+              <input type="password" placeholder="API key (jns_...)" value=${key}
+                     onInput=${(e) => setKey(e.target.value)} onKeyDown=${(e) => e.key === 'Enter' && load()} />
+              <button onClick=${load} disabled=${loading}>${loading ? '…' : 'Refresh'}</button>
+            </div>
+            ${err && html`<p class="err">${err}</p>`}
+
+            <div class="grid">
+              <${Stat} label="Requests" value=${metrics?.requests ?? '—'} />
+              <${Stat} label="Cache hit ratio" value=${metrics?.hitRatio != null ? (metrics.hitRatio * 100).toFixed(1) + '%' : '—'} />
+              <${Stat} label="Tokens (in/out)" value=${t ? t.tokens_in + ' / ' + t.tokens_out : '—'} />
+              <${Stat} label="Cost" value=${t ? money(t.cost) : '—'} />
+            </div>
+
+            ${usage && html`
+              <h2>By model — key "${usage.name}"</h2>
+              <table>
+                <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Tokens in</th><th class="num">Tokens out</th><th class="num">Cost</th></tr></thead>
+                <tbody>
+                  ${usage.by_model.length === 0
+                    ? html`<tr><td colSpan="5" style="color:var(--mut)">No usage yet for this key.</td></tr>`
+                    : usage.by_model.map((m) => html`
+                      <tr key=${m.model}>
+                        <td>${m.model}</td>
+                        <td class="num">${m.requests}</td>
+                        <td class="num">${m.tokens_in}</td>
+                        <td class="num">${m.tokens_out}</td>
+                        <td class="num">${money(m.cost)}</td>
+                      </tr>`)}
+                </tbody>
+              </table>`}
+
+            <h2>Raw /metrics</h2>
+            <pre>${raw || '…'}</pre>
+
+            <p class="foot">Enter an API key to see per-key usage. Metrics are gateway-wide and need no key.</p>
+          </div>`;
+      }
+
+      createRoot(document.getElementById('root')).render(html`<${App} />`);
+    </script>
+  </body>
+</html>
