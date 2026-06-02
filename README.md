@@ -172,14 +172,6 @@ bench/                   load-test drivers + measured results
 test/                    vitest suites
 ```
 
-## Roadmap
-
-Backend is feature-complete, including model-aware routing, provider-attributed cache entries, and exact streamed-usage accounting. Natural next steps:
-
-- Per-key model/route allow-lists and budget caps (hard spend limits, not just tracking)
-- Weighted / latency-aware provider selection instead of fixed config order
-- Half-open circuit-breaker probes so a recovered provider is retried before full cooldown elapses
-
 ## License
 
 [ISC](LICENSE)
